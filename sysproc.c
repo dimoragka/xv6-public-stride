@@ -89,3 +89,30 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+int 
+sys_info(void) 
+{
+  int m;
+  if (argint(0, &m) <0)
+    return -1;
+  return info(m);
+}
+
+int
+sys_settickets(void)
+{
+  int n;
+
+  if(argint(0, &n) < 0)
+    return -1;
+  if(n % 10 != 0 || n < 10 || n > 60)
+  {
+    return -1;
+  }
+  struct proc *proc = myproc();
+  proc->tickets = n;
+  proc->stride  = LCM / n;
+
+  return 23;
+}

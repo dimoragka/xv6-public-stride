@@ -18,6 +18,8 @@ int nextpid = 1;
 extern void forkret(void);
 extern void trapret(void);
 
+int currentMin = 0;
+
 static void wakeup1(void *chan);
 
 void
@@ -88,7 +90,9 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-
+  p->tickets = 10;
+  p->stride = LCM / p->tickets;
+  p->ticks = 0;
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -138,6 +142,9 @@ userinit(void)
   p->tf->eflags = FL_IF;
   p->tf->esp = PGSIZE;
   p->tf->eip = 0;  // beginning of initcode.S
+
+  // Set counter of system calls to zero.
+  p->syscallcount = 0;
 
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
@@ -216,6 +223,9 @@ fork(void)
 
   np->state = RUNNABLE;
 
+  // Sys call counter
+  np->syscallcount = curproc->syscallcount;
+
   release(&ptable.lock);
 
   return pid;
@@ -230,6 +240,29 @@ exit(void)
   struct proc *curproc = myproc();
   struct proc *p;
   int fd;
+
+  /*-------The following code is added to format the output--------*/
+  /* NOTE that you need to replace sched_times in the cprintf with whatever you use to record the execution time */
+  static char *states[] = {
+    [UNUSED]    "unused",
+    [EMBRYO]    "embryo",
+    [SLEEPING]  "sleep ",
+    [RUNNABLE]  "runble",
+    [RUNNING]   "run   ",
+    [ZOMBIE]    "zombie"
+  };
+  char *state;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == UNUSED)
+      continue;
+    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+      state = states[p->state];
+    else
+      state = "???";
+
+    cprintf("From  %s-%d: %d %s %s tickets=%d ticks=%d \n", myproc()->name, myproc()->pid, p->pid, state, p->name, p->tickets, p->ticks);
+  }
+  /*------------------patch end------------------------ */
 
   if(curproc == initproc)
     panic("init exiting");
@@ -311,6 +344,72 @@ wait(void)
   }
 }
 
+int getmaxpass()
+{
+    struct proc* p; // for iteration
+    int firstProc = 1;
+    int maxPass=0;
+
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+        if(p->state != UNUSED)
+        {
+            if(firstProc)
+            {
+                maxPass = p->pass;
+                firstProc = 0;
+            }
+            else if(p->pass > maxPass)
+            {
+                maxPass = p->pass;
+            }
+        }
+    }
+
+    return maxPass;
+}
+
+struct proc* getminproc()
+{
+    struct proc* p; // for iteration
+    struct proc* minProc = 0;
+    int firstProc = 1;
+
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+        if(p->state != RUNNABLE)
+            continue;
+        if(p->state != UNUSED) // P is initialized
+        {
+            if(firstProc)
+            {
+                currentMin = p->pass; // Start with the first proc
+                minProc = p;
+                firstProc = 0;
+            }
+            else if(p->pass < currentMin)
+            {
+                currentMin = p->pass;
+                minProc = p;
+            }
+        }
+    }
+    return minProc;
+}
+
+// Must alredy hold ptable.lock
+int lowerpassval()
+{
+    struct proc *p;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+        if(p->state == UNUSED)
+            continue;
+        p->pass = 0;
+    }
+    return 0;
+}
+
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -332,9 +431,18 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
+
+    p = getminproc();
+    int tentativepass = getmaxpass();
+    if (tentativepass > TENTATIVE_CEIL)
+    {
+      lowerpassval();
+    }
+
+    if (p != 0) {
+
+      p->pass += p->stride;
+      p->ticks++;
 
       // Switch to chosen process.  It is the process's job
       // to release ptable.lock and then reacquire it
@@ -351,7 +459,6 @@ scheduler(void)
       c->proc = 0;
     }
     release(&ptable.lock);
-
   }
 }
 
@@ -523,7 +630,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    cprintf("%d %s %s", p->pid, state, p->name);
+    cprintf("%d %s %s", p->pid, state, p->name, p->tickets, p->ticks);
     if(p->state == SLEEPING){
       getcallerpcs((uint*)p->context->ebp+2, pc);
       for(i=0; i<10 && pc[i] != 0; i++)
@@ -531,4 +638,66 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+
+int info(int m)
+{
+  struct proc *p;
+
+  // Loop over process table looking for process with pid.
+  acquire(&ptable.lock);
+
+  // Enable interrupts on this processor.
+  sti();
+
+  if ( m == 1 )
+  {
+
+    // Number of processes (sleeping + running + runnable)
+    int np = 0;
+
+    cprintf("name \t pid \t state \n");
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+      if ( p->state == SLEEPING ) 
+      {
+        np++;
+        cprintf("%s \t %d  \t SLEEPING \n ", p->name, p->pid );
+      }
+      else if ( p->state == RUNNING )
+      {
+        np++;
+        cprintf("%s \t %d  \t RUNNING \n ", p->name, p->pid );
+      }
+      else if ( p->state == RUNNABLE )
+      {
+        np++;
+        cprintf("%s \t %d  \t RUNNABLE \n ", p->name, p->pid );
+      }
+    }
+
+      cprintf("total number of processes: %d\n", np);
+  }
+  else {
+    for (p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+      if (strncmp(p->name, "info", 1000) == 0)
+      {
+        if ( m == 2)
+        {
+          cprintf("Number of system calls by process %s are %d \n", p->name, p->syscallcount);
+        }
+        if ( m == 3)
+        {
+          cprintf("Number of memory pages used by process %s are %d \n", p->name, p->sz / 4096);
+        }
+      }
+    }
+  }
+
+  release(&ptable.lock);
+
+  return 22;
+
 }
